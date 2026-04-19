@@ -43,15 +43,49 @@
 #include <limits.h>
 #include <sys/resource.h>
 
+#ifdef FUSE_NFS_WORKAROUND
+#include <dlfcn.h>
+#endif
+
 static struct thread_root troot = THREAD_ROOT_INITIALIZER;
 static int server_mode = 0;
 static pid_t ourpgid;
 static int max_open_files = 128;
 
+#ifdef FUSE_NFS_WORKAROUND
+static int readdir_getattr_workaround = 0;
+
+/* Some FUSE implementations (e.g. Fuse-T) use NFS internally, where the
+ * NFS client will stat every directory entry of each readdir.
+ *
+ * The exact conditions of this behavior are not known, and we therefore
+ * probe for it at startup. By listing a virtual directory, we watch for
+ * whether a stat is issued for a sentinel file from that listing. If
+ * this stat occurs, the workaround is enabled. The main thread then
+ * stats a separate "done" file to finalize the probe.
+ *
+ * UNCHECKED -> readdir on probe dir           -> SENTINEL
+ * SENTINEL  -> getattr on sentinel            -> enable workaround
+ *              getattr on done file           -> DONE
+ */
+enum nfs_probe_state {
+	NFS_PROBE_UNCHECKED,
+	NFS_PROBE_SENTINEL,
+	NFS_PROBE_DONE
+};
+
+static volatile enum nfs_probe_state nfs_probe = NFS_PROBE_UNCHECKED;
+
+#define NFS_PROBE_DIR_NAME "@nfs_probe@"
+#define NFS_PROBE_SENTINEL_NAME ".nfs_sentinel"
+#define NFS_PROBE_DONE_NAME ".nfs_done"
+#endif
+
 void tup_fuse_fs_init(void)
 {
 	struct rlimit rlim;
 	ourpgid = getpgid(0);
+
 	if(getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
 		int x;
 		for(x=0; x<10; x++) {
@@ -358,12 +392,38 @@ static int tup_fs_getattr(const char *path, struct stat *stbuf)
 	const char *var;
 	const char *stripped = NULL;
 	int rc;
+	int skip_read = 0;
 
 #ifdef FUSE3
 	(void) fi;
 #endif
 	if(context_check() < 0)
 		return -EPERM;
+
+#ifdef FUSE_NFS_WORKAROUND
+	if(nfs_probe != NFS_PROBE_DONE) {
+		const char *base = strrchr(path, '/');
+		if(base) base++; else base = path;
+		if(strcmp(base, NFS_PROBE_DIR_NAME) == 0) {
+			memset(stbuf, 0, sizeof(*stbuf));
+			stbuf->st_mode = S_IFDIR | 0555;
+			stbuf->st_nlink = 2;
+			return 0;
+		}
+		if(nfs_probe == NFS_PROBE_SENTINEL) {
+			if(strcmp(base, NFS_PROBE_SENTINEL_NAME) == 0) {
+				readdir_getattr_workaround = 1;
+				memset(stbuf, 0, sizeof(*stbuf));
+				stbuf->st_mode = S_IFREG | 0444;
+				return 0;
+			}
+			if(strcmp(base, NFS_PROBE_DONE_NAME) == 0) {
+				nfs_probe = NFS_PROBE_DONE;
+				return -ENOENT;
+			}
+		}
+	}
+#endif
 
 	peeled = peel(path);
 
@@ -393,6 +453,20 @@ static int tup_fs_getattr(const char *path, struct stat *stbuf)
 		map = find_mapping(finfo, path);
 		if(map)
 			peeled = map->tmpname;
+#ifdef FUSE_NFS_WORKAROUND
+		/* Under Fuse-T NFS, readdir is followed by automatic stat of
+		 * each directory entry. If this path was recorded in
+		 * readdir_sticky, consume it and skip ACCESS_READ later.
+		 */
+		if(readdir_getattr_workaround) {
+			struct string_tree *st;
+			st = string_tree_search(&finfo->readdir_sticky, path, strlen(path));
+			if(st) {
+				string_tree_remove(&finfo->readdir_sticky, st);
+				skip_read = 1;
+			}
+		}
+#endif
 		put_finfo(finfo);
 	}
 
@@ -433,7 +507,9 @@ static int tup_fs_getattr(const char *path, struct stat *stbuf)
 	} else {
 		rc = 0;
 	}
-	tup_fuse_handle_file(path, stripped, ACCESS_READ);
+
+	if(!skip_read)
+		tup_fuse_handle_file(path, stripped, ACCESS_READ);
 
 	return rc;
 }
@@ -610,6 +686,21 @@ static int tup_fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if(context_check() < 0)
 		return -EPERM;
 
+#ifdef FUSE_NFS_WORKAROUND
+	if(nfs_probe == NFS_PROBE_UNCHECKED) {
+		const char *base = strrchr(path, '/');
+		if(base) base++; else base = path;
+		if(strcmp(base, NFS_PROBE_DIR_NAME) == 0) {
+			struct stat st;
+			memset(&st, 0, sizeof(st));
+			st.st_mode = S_IFREG | 0444;
+			filler(buf, NFS_PROBE_SENTINEL_NAME, &st, 0);
+			nfs_probe = NFS_PROBE_SENTINEL;
+			return 0;
+		}
+	}
+#endif
+
 	peeled = peel(path);
 	finfo = get_finfo(path);
 	if(finfo) {
@@ -723,7 +814,60 @@ static int tup_fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	/* If finfo is NULL, we're outside of tup, so we don't need to ignore
 	 * any files called '.tup' in that case.
 	 */
-	return fill_actual_directory(peeled, buf, filler, finfo != NULL);
+	int rc = fill_actual_directory(peeled, buf, filler, finfo != NULL);
+
+#ifdef FUSE_NFS_WORKAROUND
+	/* Under Fuse-T NFS, readdir causes an immediate stat to each
+	 * directory entry, so add them to a tree that tells getattr to
+	 * avoid dispatching one ACCESS_READ for each.
+	 */
+	if(finfo != NULL && rc >= 0 && readdir_getattr_workaround) {
+		finfo_lock(finfo);
+		int fd;
+		fd = openat(tup_top_fd(), peeled, O_RDONLY);
+		if(fd >= 0) {
+			DIR *dp;
+			dp = fdopendir(fd);
+			if(dp) {
+				struct dirent *de;
+				int pathlen = strlen(path);
+
+				while((de = readdir(dp)) != NULL) {
+					struct string_tree *st;
+					char *fullpath;
+					int namelen = strlen(de->d_name);
+					int fulllen = pathlen + 1 + namelen;
+
+					fullpath = malloc(fulllen + 1);
+					if(!fullpath)
+						break;
+					memcpy(fullpath, path, pathlen);
+					fullpath[pathlen] = '/';
+					memcpy(fullpath + pathlen + 1, de->d_name, namelen + 1);
+
+					st = malloc(sizeof(*st));
+					if(!st) {
+						free(fullpath);
+						break;
+					}
+					st->s = fullpath;
+					st->len = fulllen;
+					if(string_tree_insert(&finfo->readdir_sticky, st) < 0) {
+						/* Duplicate entry, already in set */
+						free(fullpath);
+						free(st);
+					}
+				}
+				closedir(dp);
+			} else {
+				close(fd);
+			}
+		}
+		finfo_unlock(finfo);
+	}
+#endif
+
+	return rc;
 }
 
 static int mknod_internal(const char *path, mode_t mode, int flags, int close_fd)
