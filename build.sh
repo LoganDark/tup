@@ -9,6 +9,9 @@ case "$os" in
 		default_server=fuse3
 		monitor=inotify.c
 	;;
+	Darwin)
+		monitor=fsevents.c
+	;;
 esac
 
 server=${TUP_SERVER:-$default_server}
@@ -47,6 +50,7 @@ case "$os" in
 	plat_files="$plat_files ../src/compat/dummy.c"
 	plat_files="$plat_files ../src/compat/clearenv.c "
 	plat_cflags="$plat_cflags -include ../src/compat/macosx.h"
+	plat_ldflags="$plat_ldflags -framework CoreServices"
 	default_cc=clang
 	;;
 	FreeBSD)
@@ -87,7 +91,7 @@ CFLAGS="$CFLAGS -DTUP_SERVER=\"$server\""
 CFLAGS="$CFLAGS -DPCRE2_CODE_UNIT_WIDTH=8"
 CFLAGS="$CFLAGS -DHAVE_CONFIG_H"
 
-for i in ../src/tup/*.c ../src/tup/tup/main.c ../src/tup/monitor/$monitor ../src/tup/flock/fcntl.c ../src/inih/ini.c ../src/pcre/*.c $plat_files; do
+for i in ../src/tup/*.c ../src/tup/tup/main.c ../src/tup/monitor/$monitor ../src/tup/monitor/common.c ../src/tup/flock/fcntl.c ../src/inih/ini.c ../src/pcre/*.c $plat_files; do
 	echo "  bootstrap CC $CFLAGS $i"
 	# Put -I. first so we find our new luabuiltin.h file, not one built
 	# by a previous invocation of 'tup'.
