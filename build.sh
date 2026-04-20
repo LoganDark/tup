@@ -47,6 +47,7 @@ case "$os" in
 	plat_cflags="$plat_cflags -D_REENTRANT"
 	;;
 	Darwin)
+	flock_backend=flock
 	plat_files="$plat_files ../src/compat/dummy.c"
 	plat_files="$plat_files ../src/compat/clearenv.c "
 	plat_cflags="$plat_cflags -include ../src/compat/macosx.h"
@@ -66,6 +67,7 @@ case "$os" in
 	;;
 esac
 : ${CC:=$default_cc}
+: ${flock_backend:=fcntl}
 
 rm -rf build
 echo "  mkdir build"
@@ -91,7 +93,7 @@ CFLAGS="$CFLAGS -DTUP_SERVER=\"$server\""
 CFLAGS="$CFLAGS -DPCRE2_CODE_UNIT_WIDTH=8"
 CFLAGS="$CFLAGS -DHAVE_CONFIG_H"
 
-for i in ../src/tup/*.c ../src/tup/tup/main.c ../src/tup/monitor/$monitor ../src/tup/monitor/common.c ../src/tup/flock/fcntl.c ../src/inih/ini.c ../src/pcre/*.c $plat_files; do
+for i in ../src/tup/*.c ../src/tup/tup/main.c ../src/tup/monitor/$monitor ../src/tup/monitor/common.c ../src/tup/flock/$flock_backend.c ../src/inih/ini.c ../src/pcre/*.c $plat_files; do
 	echo "  bootstrap CC $CFLAGS $i"
 	# Put -I. first so we find our new luabuiltin.h file, not one built
 	# by a previous invocation of 'tup'.

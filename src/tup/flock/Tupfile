@@ -1,7 +1,11 @@
 include_rules
 
 ifneq ($(TARGET),win32)
+ifeq ($(TARGET),macosx)
+: foreach flock.c |> !cc |>
+else
 : foreach fcntl.c |> !cc |>
+endif
 else
 : foreach lock_file.c |> !cc |>
 endif

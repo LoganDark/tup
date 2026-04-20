@@ -35,6 +35,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/event.h>
 #include <errno.h>
 #include <unistd.h>
 #include <CoreServices/CoreServices.h>
@@ -74,6 +75,7 @@ static struct sigaction sigact = {
 static volatile sig_atomic_t monitor_quit = 0;
 
 static int locked = 1;
+static int backgrounding = 0;
 
 /* Tracks whether events occurred while locked (ie, while we have control) */
 static pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -127,24 +129,52 @@ int monitor(int argc, char **argv)
 		}
 	} else {
 		if(fork() > 0) {
-			/* Remove our object lock, then wait for the child
-			 * process to get it.
+			int kq;
+			struct kevent ev;
+
+			/* Set up kqueue to watch for the child's signal
+			 * (a no-op ftruncate) on the obj-lock file. Register
+			 * BEFORE unlocking so we can't miss the event.
 			 */
-			tup_unflock(tup_obj_lock());
-			if(tup_wait_flock(tup_obj_lock()) < 0)
+			kq = kqueue();
+			if(kq < 0) {
+				perror("kqueue");
 				exit(1);
+			}
+			EV_SET(&ev, tup_obj_lock(), EVFILT_VNODE,
+			       EV_ADD | EV_ENABLE, NOTE_ATTRIB, 0, NULL);
+			if(kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+				perror("kevent register");
+				close(kq);
+				exit(1);
+			}
+
+			/* Release obj-lock, then wait for child to signal */
+			tup_unflock(tup_obj_lock());
+			if(kevent(kq, NULL, 0, &ev, 1, NULL) < 0) {
+				perror("kevent wait");
+				close(kq);
+				exit(1);
+			}
+			close(kq);
+
 			if(tup_cleanup() < 0)
 				exit(1);
 			tup_valgrind_cleanup();
 			exit(0);
 		}
 
-		/* Child must re-acquire the object lock, since we lost it at
-		 * the fork
+		/* Re-open lock files to get independent file descriptions.
+		 * flock(2) locks are per-file-description and shared across
+		 * fork, so we need our own fds to lock independently.
 		 */
+		if(tup_lock_reopen() < 0) {
+			return -1;
+		}
 		if(tup_flock(tup_obj_lock()) < 0) {
 			return -1;
 		}
+		backgrounding = 1;
 	}
 
 	if(monitor_set_pid(getpid()) < 0) {
@@ -298,15 +328,53 @@ static int do_scan(void)
 	return 0;
 }
 
+/* Wait for NOTE_FUNLOCK on the object lock file using kqueue. This fires
+ * the instant another process releases or closes its flock on the file.
+ * Returns: 0 = lock released, -1 = error
+ */
+static int wait_obj_unlock(void)
+{
+	int kq;
+	struct kevent ev;
+	int ret;
+
+	kq = kqueue();
+	if(kq < 0) {
+		perror("kqueue");
+		return -1;
+	}
+
+	EV_SET(&ev, tup_obj_lock(), EVFILT_VNODE, EV_ADD | EV_ENABLE,
+	       NOTE_FUNLOCK, 0, NULL);
+	if(kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+		perror("kevent register NOTE_FUNLOCK");
+		close(kq);
+		return -1;
+	}
+
+	/* Block until the lock is released */
+	ret = kevent(kq, NULL, 0, &ev, 1, NULL);
+	close(kq);
+	if(ret < 0) {
+		if(errno == EINTR)
+			return 0;
+		perror("kevent wait NOTE_FUNLOCK");
+		return -1;
+	}
+	return 0;
+}
+
 /* Check if another tup process wants the object lock.
  *
  * The tri-lock protocol:
  * - The monitor holds the object lock and has released the shared lock.
  * - When another tup process wants to run, it first acquires the shared
- *   lock, then opens and tries to flock the object lock (blocking).
+ *   lock, then tries to flock the object lock (blocking).
  * - We detect this by probing the shared lock every 100ms. If we can't
  *   get it, someone else has it and is about to want the object lock.
- * - Take tri-lock, release obj-lock, wait for obj-lock back.
+ * - Yield: take tri-lock, release obj-lock, wait for NOTE_FUNLOCK on
+ *   obj-lock (fired when the other process releases/closes it), then
+ *   re-acquire obj-lock and release tri-lock.
  *
  * Returns: 0 = still online or back online, -1 = error
  */
@@ -347,15 +415,19 @@ static int check_lock_state(void)
 
 	DEBUGP("monitor off\n");
 
-	/* Block until the other process is done and releases the object lock.
-	 * This is equivalent to waiting for IN_CLOSE in the inotify monitor.
+	/* Wait for the other process to release the object lock. kqueue
+	 * NOTE_FUNLOCK fires the instant flock is released or the fd is
+	 * closed - no polling, no race.
 	 */
+	if(wait_obj_unlock() < 0)
+		return -1;
+
+	/* Re-acquire obj-lock */
 	if(tup_flock(tup_obj_lock()) < 0)
 		return -1;
 
-	/* We have the obj-lock again. Release tri-lock so the other process
-	 * can finish tup_lock_exit() (it waits on tri-lock before releasing
-	 * the shared lock).
+	/* Release tri-lock so the other process can finish tup_lock_exit()
+	 * (it waits on tri-lock before releasing the shared lock).
 	 */
 	if(tup_unflock(tup_tri_lock()) < 0)
 		return -1;
@@ -413,6 +485,18 @@ static int monitor_loop(void)
 
 	timespan_end(&ts);
 	fprintf(stderr, "Initialized in %f seconds.\n", timespan_seconds(&ts));
+
+	/* In background mode, signal the parent that we're ready. The
+	 * parent is blocked on kqueue waiting for NOTE_ATTRIB on the
+	 * obj-lock file before it exits.
+	 */
+	if(backgrounding) {
+		if(ftruncate(tup_obj_lock(), 0) < 0) {
+			perror("ftruncate obj lock");
+			return -1;
+		}
+		backgrounding = 0;
+	}
 
 	/* Create FSEvents stream */
 	path_to_watch = CFStringCreateWithCString(NULL, get_tup_top(), kCFStringEncodingUTF8);
