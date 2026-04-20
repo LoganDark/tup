@@ -34,6 +34,9 @@
 #include "tup/variant.h"
 #include "tup/container.h"
 #include "tup_fuse_fs.h"
+#ifdef FUSE_NFS_WORKAROUND
+#include <fuse_lowlevel.h>
+#endif
 #include "master_fork.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +44,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/mount.h>
+#ifdef FUSE_NFS_WORKAROUND
+#include <dirent.h>
+#endif
 #ifdef __linux__
 #include <sys/sysmacros.h>
 #include <grp.h>
@@ -69,6 +75,12 @@ static pthread_t fuse_tid;
 static void *fuse_thread(void *arg)
 {
 	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
+#ifdef FUSE_NFS_WORKAROUND
+	struct fuse *fuse;
+	char *mountpoint;
+	int multithreaded;
+#endif
+
 	if(arg) {}
 
 	/* Need a garbage arg first to count as the process name */
@@ -97,8 +109,41 @@ static void *fuse_thread(void *arg)
 		return NULL;
 #endif
 
+#ifdef FUSE_NFS_WORKAROUND
+	/* Use fuse_setup + fuse_loop instead of fuse_main so we can
+	 * control teardown. On Fuse-T, fuse_main's teardown restores
+	 * SIGPIPE to SIG_DFL before closing the NFS socket, which
+	 * immediately kills the process with a non-zero exit code.
+	 */
+	fuse = fuse_setup(args.argc, args.argv, &tup_fs_oper,
+			  sizeof(tup_fs_oper), &mountpoint,
+			  &multithreaded, NULL);
+	fuse_opt_free_args(&args);
+	if(fuse == NULL)
+		return NULL;
+
+	if(multithreaded)
+		fuse_loop_mt(fuse);
+	else
+		fuse_loop(fuse);
+
+	/* Manual teardown: remove signal handlers, then re-ignore
+	 * SIGPIPE before the unmount closes the NFS socket.
+	 */
+	{
+		struct fuse_session *se = fuse_get_session(fuse);
+		struct fuse_chan *ch = fuse_session_next_chan(se, NULL);
+		fuse_remove_signal_handlers(se);
+		signal(SIGPIPE, SIG_IGN);
+		fuse_unmount(NULL, ch);
+		fuse_destroy(fuse);
+		free(mountpoint);
+	}
+#else
 	fuse_main(args.argc, args.argv, &tup_fs_oper, NULL);
 	fuse_opt_free_args(&args);
+#endif
+
 	return NULL;
 }
 
@@ -337,6 +382,37 @@ out_ok:
 	 * to wait for the master_fork thread.
 	 */
 	signal(SIGCHLD, SIG_DFL);
+#endif
+
+#ifdef FUSE_NFS_WORKAROUND
+	/* Probe whether readdir triggers a stat of the returned entries
+	 * (e.g. Fuse-T). After reading a virtual probe directory, if the
+	 * sentinel file gets a getattr, the workaround is enabled
+	 * automatically by the FUSE callbacks.
+	 */
+	{
+		char probepath[PATH_MAX];
+		DIR *dp;
+		struct stat st;
+		snprintf(probepath, sizeof(probepath), "%s%s/@nfs_probe@",
+			 TUP_MNT, get_tup_top());
+		dp = opendir(probepath);
+		if(dp) {
+			/* If the NFS behavior is present, this readdir
+			 * will cause automatic getattr on the sentinel,
+			 * enabling the workaround.
+			 */
+			readdir(dp);
+			closedir(dp);
+		}
+		/* Finalize the probe by statting the done file. This
+		 * transitions the state machine to DONE regardless of
+		 * whether the sentinel was hit.
+		 */
+		snprintf(probepath, sizeof(probepath), "%s%s/@nfs_probe@/.nfs_done",
+			 TUP_MNT, get_tup_top());
+		stat(probepath, &st);
+	}
 #endif
 
 	server_inited = 1;

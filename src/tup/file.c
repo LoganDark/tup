@@ -62,6 +62,7 @@ int init_file_info(struct file_info *info, int do_unlink)
 	tent_tree_init(&info->used_groups_root);
 	tent_tree_init(&info->output_root);
 	tent_tree_init(&info->exclusion_root);
+	RB_INIT(&info->readdir_sticky);
 	pthread_mutex_init(&info->lock, NULL);
 	pthread_cond_init(&info->cond, NULL);
 	info->server_fail = 0;
@@ -72,6 +73,7 @@ int init_file_info(struct file_info *info, int do_unlink)
 
 void cleanup_file_info(struct file_info *info)
 {
+	free_string_tree(&info->readdir_sticky);
 	free_tent_tree(&info->exclusion_root);
 	free_tent_tree(&info->output_root);
 	free_tent_tree(&info->used_groups_root);
