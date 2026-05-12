@@ -438,31 +438,27 @@ static int check_lock_state(void)
 
 	DEBUGP("shared lock contention - yielding\n");
 
-	/* Drain pending FSEvents into the db before releasing the lock.
-	 * Otherwise the other process gets the lock with the db still
-	 * reflecting the pre-event state — file creates made just before
-	 * it called `tup upd` look like they never happened. Inotify's
-	 * monitor solves the same problem by calling flush_queue() before
-	 * yielding (inotify.c handle of IN_OPEN on obj_wd).
+	/* Always run do_scan before releasing the lock, regardless of
+	 * events_occurred. FSEvents has ~100ms debounce/delivery latency,
+	 * so a change made just before the contending process called
+	 * `tup upd` may not have fired our callback yet by the time the
+	 * 100ms-poll detects contention — the events_occurred flag races
+	 * the lock probe. A stat-walk on yield always closes that window.
+	 * Inotify reaches the same shape by draining its event queue at
+	 * the yield (inotify.c handle of IN_OPEN on obj_wd → flush_queue).
 	 *
-	 * try_autoupdate() runs here so `tup flush` can observe the
+	 * try_autoupdate() also runs so `tup flush` can observe the
 	 * AUTOUPDATE_PID it polls for. The bomb risk (autoupdate's own
 	 * writes triggering more autoupdate) is contained by mod_cb's
-	 * GENERATED filter, not by suppressing autoupdate at the yield.
+	 * GENERATED/CMD filter, not by suppressing autoupdate at the yield.
 	 */
-	{
-		int have_events;
-		pthread_mutex_lock(&event_lock);
-		have_events = events_occurred;
-		events_occurred = 0;
-		pthread_mutex_unlock(&event_lock);
-		if(have_events) {
-			if(do_scan() < 0)
-				return -1;
-			if(try_autoupdate() < 0)
-				return -1;
-		}
-	}
+	pthread_mutex_lock(&event_lock);
+	events_occurred = 0;
+	pthread_mutex_unlock(&event_lock);
+	if(do_scan() < 0)
+		return -1;
+	if(try_autoupdate() < 0)
+		return -1;
 
 	locked = 0;
 
