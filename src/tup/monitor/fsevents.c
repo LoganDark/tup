@@ -62,11 +62,11 @@ static int monitor_loop(void);
 static int try_autoupdate(void);
 static void sighandler(int sig);
 static void fsevents_callback(ConstFSEventStreamRef streamRef,
-			      void *clientCallBackInfo,
-			      size_t numEvents,
-			      void *eventPaths,
-			      const FSEventStreamEventFlags eventFlags[],
-			      const FSEventStreamEventId eventIds[]);
+                              void *clientCallBackInfo,
+                              size_t numEvents,
+                              void *eventPaths,
+                              const FSEventStreamEventFlags eventFlags[],
+                              const FSEventStreamEventId eventIds[]);
 
 static struct sigaction sigact = {
 	.sa_handler = sighandler,
@@ -229,18 +229,37 @@ int monitor(int argc, char **argv)
 
 static int mod_cb(void *arg, struct tup_entry *tent)
 {
-	if(tent) {}
+	/* Only user-visible file changes should trigger autoupdate. Skip:
+	 *
+	 *   GENERATED / GENERATED_DIR — autoupdate writes its own outputs,
+	 *     and FSEvents delivers those writes back to us. Counting them
+	 *     would fire a follow-up autoupdate on every cycle.
+	 *
+	 *   CMD — when a generated file changes, tup_file_mod_mtime flags
+	 *     the producing command as MODIFY so the next explicit `tup
+	 *     upd` re-runs it. That's a downstream propagation, not a
+	 *     user edit, and we'd otherwise loop on the cmd's flag set
+	 *     by our own do_scan after each autoupdate cycle.
+	 *
+	 * Inotify reaches the same shape via per-event filtering inside
+	 * handle_event (TUP_NODE_GENERATED skips in the IN_CREATE/
+	 * IN_MODIFY branches). We filter at the flag-scan level instead.
+	 */
+	if(tent && (tent->type == TUP_NODE_GENERATED ||
+	            tent->type == TUP_NODE_GENERATED_DIR ||
+	            tent->type == TUP_NODE_CMD))
+		return 0;
 	*(int*)arg = 1;
 	return 0;
 }
 
 /* FSEvents callback - runs on the FSEvents dispatch queue thread */
 static void fsevents_callback(ConstFSEventStreamRef streamRef,
-			      void *clientCallBackInfo,
-			      size_t numEvents,
-			      void *eventPaths,
-			      const FSEventStreamEventFlags eventFlags[],
-			      const FSEventStreamEventId eventIds[])
+                              void *clientCallBackInfo,
+                              size_t numEvents,
+                              void *eventPaths,
+                              const FSEventStreamEventFlags eventFlags[],
+                              const FSEventStreamEventId eventIds[])
 {
 	size_t i;
 	char **paths = (char **)eventPaths;
@@ -255,7 +274,7 @@ static void fsevents_callback(ConstFSEventStreamRef streamRef,
 		DEBUGP("FSEvent: '%s' flags=%08x\n", paths[i], flags);
 
 		if(flags & (kFSEventStreamEventFlagRootChanged |
-			    kFSEventStreamEventFlagMustScanSubDirs)) {
+		            kFSEventStreamEventFlagMustScanSubDirs)) {
 			DEBUGP("root changed or must-rescan\n");
 		}
 
@@ -275,32 +294,48 @@ static int wp_callback(tupid_t newdt, const char *file, int *skip)
 
 /* Check if there are pending modifications and trigger autoupdate or
  * autoparse if configured. Returns 0 on success, -1 on error.
+ *
+ * Gated on AUTOUPDATE_PID being clear. Without that gate, calling this
+ * twice in quick succession (e.g. once from the main loop and again
+ * from the yield path before the spawned `tup autoupdate` has acquired
+ * the lock and cleared the create/modify flags) fires a second
+ * autoupdate against the same flags — and the second autoupdate then
+ * contends for the lock too, triggering a third yield+fire, etc. The
+ * AUTOUPDATE_PID config entry is set by autoupdate() and cleared by
+ * the `tup autoupdate` child when it exits, so checking it tells us
+ * whether a prior fire is still in flight.
  */
 static int try_autoupdate(void)
 {
 	int modified = 0;
+	int pid;
+	const char *cmd;
 
-	if(autoupdate_enabled()) {
-		if(tup_db_begin() < 0)
+	if(autoupdate_enabled())
+		cmd = "autoupdate";
+	else if(autoparse_enabled())
+		cmd = "autoparse";
+	else
+		return 0;
+
+	if(tup_db_begin() < 0)
+		return -1;
+	if(tup_db_config_get_int(AUTOUPDATE_PID, -1, &pid) < 0)
+		return -1;
+	if(pid == -1) {
+		if(tup_db_select_node_by_flags(mod_cb, &modified,
+		                               TUP_FLAGS_CREATE) < 0)
 			return -1;
-		if(tup_db_select_node_by_flags(mod_cb, &modified, TUP_FLAGS_CREATE) < 0)
-			return -1;
-		if(tup_db_select_node_by_flags(mod_cb, &modified, TUP_FLAGS_MODIFY) < 0)
-			return -1;
-		if(tup_db_commit() < 0)
-			return -1;
-		if(modified && autoupdate("autoupdate") < 0)
-			return -1;
-	} else if(autoparse_enabled()) {
-		if(tup_db_begin() < 0)
-			return -1;
-		if(tup_db_select_node_by_flags(mod_cb, &modified, TUP_FLAGS_CREATE) < 0)
-			return -1;
-		if(tup_db_commit() < 0)
-			return -1;
-		if(modified && autoupdate("autoparse") < 0)
+		if(strcmp(cmd, "autoupdate") == 0 &&
+		   tup_db_select_node_by_flags(mod_cb, &modified,
+		                               TUP_FLAGS_MODIFY) < 0)
 			return -1;
 	}
+	if(tup_db_commit() < 0)
+		return -1;
+
+	if(pid == -1 && modified && autoupdate(cmd) < 0)
+		return -1;
 	return 0;
 }
 
@@ -402,6 +437,32 @@ static int check_lock_state(void)
 	 */
 
 	DEBUGP("shared lock contention - yielding\n");
+
+	/* Drain pending FSEvents into the db before releasing the lock.
+	 * Otherwise the other process gets the lock with the db still
+	 * reflecting the pre-event state — file creates made just before
+	 * it called `tup upd` look like they never happened. Inotify's
+	 * monitor solves the same problem by calling flush_queue() before
+	 * yielding (inotify.c handle of IN_OPEN on obj_wd).
+	 *
+	 * try_autoupdate() runs here so `tup flush` can observe the
+	 * AUTOUPDATE_PID it polls for. The bomb risk (autoupdate's own
+	 * writes triggering more autoupdate) is contained by mod_cb's
+	 * GENERATED filter, not by suppressing autoupdate at the yield.
+	 */
+	{
+		int have_events;
+		pthread_mutex_lock(&event_lock);
+		have_events = events_occurred;
+		events_occurred = 0;
+		pthread_mutex_unlock(&event_lock);
+		if(have_events) {
+			if(do_scan() < 0)
+				return -1;
+			if(try_autoupdate() < 0)
+				return -1;
+		}
+	}
 
 	locked = 0;
 
