@@ -342,6 +342,7 @@ static int try_autoupdate(void)
 static int do_scan(void)
 {
 	struct timespan ts;
+	int rc;
 
 	timespan_start(&ts);
 
@@ -354,7 +355,17 @@ static int do_scan(void)
 
 	if(tup_db_scan_begin() < 0)
 		return -1;
-	if(watch_path(0, ".", wp_callback) < 0)
+	/* Enable inode-based rename detection for this scan only. The
+	 * one-shot scanner (`tup scan` / `tup upd` without monitor) keeps
+	 * the legacy delete+create semantics — tests like t5012 rely on
+	 * it. Renames inside an active monitor session, by contrast,
+	 * should match what inotify's MOVED_FROM/MOVED_TO pair handling
+	 * delivers: identity preserved.
+	 */
+	watch_path_set_detect_rename(1);
+	rc = watch_path(0, ".", wp_callback);
+	watch_path_set_detect_rename(0);
+	if(rc < 0)
 		return -1;
 	if(tup_db_scan_end() < 0)
 		return -1;
